@@ -1,0 +1,452 @@
+package com.example.meinesammlung
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+
+/** Daten, die MusicBrainz zu einer Musik-CD gefunden hat. */
+data class MusicLookupResult(
+    val title: String,
+    val artist: String,
+    val releaseDate: String,
+    val coverUrl: String
+)
+
+/** Ein Suchtreffer für eine CD-Veröffentlichung aus MusicBrainz. */
+data class MusicReleaseSearchResult(
+    val id: String,
+    val title: String,
+    val artist: String,
+    val releaseDate: String,
+    val country: String,
+    val format: String,
+    val barcode: String,
+    val coverUrl: String,
+    val releaseGroupId: String
+)
+
+/** Sucht Musikveröffentlichungen anhand von Albumtitel und optionalem Interpreten.
+ * Die Ergebnisse werden lokal nach der Ähnlichkeit des Titels sortiert.
+ */
+suspend fun searchMusicReleases(title: String, artist: String = ""): List<MusicReleaseSearchResult> =
+    withContext(Dispatchers.IO) {
+        val cleanTitle = title.trim()
+        val cleanArtist = artist.trim()
+        if (cleanTitle.length < 2) return@withContext emptyList()
+
+        fun escapeLucene(value: String): String =
+            value.replace("\\", "\\\\").replace("\"", "\\\"")
+
+        // Alle sinnvollen Titelwörter berücksichtigen, statt nur die ersten exakten
+        // Phrasentreffer zu holen. Dadurch kann z. B. "Let Go" weiter unten nicht
+        // von "Let's Go Girl" verdrängt werden.
+        val titleTerms = cleanTitle.split(Regex("\\s+")).filter { it.isNotBlank() }
+        // Suche zunächst nur anhand der Titelwörter. Ein zusätzlicher strenger
+        // artist:-Filter kann gültige Compilations und Schreibvarianten ausschließen.
+        // Der Interpret wird nach dem Abruf lokal bewertet.
+        val queryText = titleTerms.joinToString(" AND ") { "release:\"${escapeLucene(it)}\"" }
+        var connection: HttpURLConnection? = null
+        try {
+            val encodedQuery = URLEncoder.encode(queryText, "UTF-8")
+            val url = URL("https://musicbrainz.org/ws/2/release/?query=$encodedQuery&fmt=json&limit=100")
+            connection = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 12000
+                readTimeout = 12000
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("User-Agent", "MeineSammlung/1.0 (personal Android collection app)")
+            }
+            if (connection.responseCode !in 200..299) return@withContext emptyList()
+            val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val releases = JSONObject(body).optJSONArray("releases") ?: return@withContext emptyList()
+            val matches = mutableListOf<MusicReleaseSearchResult>()
+            for (i in 0 until releases.length()) {
+                val release = releases.optJSONObject(i) ?: continue
+                val releaseTitle = release.optString("title").trim()
+                if (releaseTitle.isBlank()) continue
+                val artists = mutableListOf<String>()
+                val credits = release.optJSONArray("artist-credit")
+                if (credits != null) {
+                    for (j in 0 until credits.length()) {
+                        val credit = credits.optJSONObject(j) ?: continue
+                        val name = credit.optString("name").ifBlank {
+                            credit.optJSONObject("artist")?.optString("name").orEmpty()
+                        }
+                        if (name.isNotBlank()) artists.add(name)
+                        val join = credit.optString("joinphrase")
+                        if (join.isNotBlank() && artists.isNotEmpty()) {
+                            artists[artists.lastIndex] = artists.last() + join
+                        }
+                    }
+                }
+                val releaseId = release.optString("id").trim()
+                matches.add(
+                    MusicReleaseSearchResult(
+                        id = releaseId,
+                        title = releaseTitle,
+                        artist = artists.joinToString("").trim(),
+                        releaseDate = release.optString("date").trim(),
+                        country = release.optString("country").trim(),
+                        format = release.optJSONArray("media")?.optJSONObject(0)?.optString("format").orEmpty().trim(),
+                        barcode = release.optString("barcode").trim(),
+                        coverUrl = if (releaseId.isNotBlank()) "https://coverartarchive.org/release/$releaseId/front-500" else "",
+                        releaseGroupId = release.optJSONObject("release-group")?.optString("id")?.trim().orEmpty()
+                    )
+                )
+            }
+
+            fun normalize(value: String) = value.lowercase()
+                .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+                .trim()
+                .replace(Regex("\\s+"), " ")
+
+            val wantedTitle = normalize(cleanTitle)
+            val wantedArtist = normalize(cleanArtist)
+            matches.sortedWith(
+                compareByDescending<MusicReleaseSearchResult> { result ->
+                    val candidate = normalize(result.title)
+                    when {
+                        candidate == wantedTitle -> 1000
+                        candidate.startsWith("$wantedTitle ") -> 900
+                        candidate.startsWith(wantedTitle) -> 850
+                        candidate.contains(wantedTitle) -> 800
+                        else -> {
+                            val wantedWords = wantedTitle.split(" ").filter { it.isNotBlank() }.toSet()
+                            val candidateWords = candidate.split(" ").filter { it.isNotBlank() }.toSet()
+                            if (wantedWords.isEmpty()) 0 else (wantedWords.intersect(candidateWords).size * 100 / wantedWords.size)
+                        }
+                    }
+                }.thenByDescending { result ->
+                    if (wantedArtist.isBlank()) 0 else {
+                        val candidateArtist = normalize(result.artist)
+                        when {
+                            candidateArtist == wantedArtist -> 3
+                            candidateArtist.contains(wantedArtist) -> 2
+                            wantedArtist.contains(candidateArtist) && candidateArtist.isNotBlank() -> 1
+                            else -> 0
+                        }
+                    }
+                }.thenByDescending { it.releaseDate }
+            )
+        } catch (_: Exception) {
+            emptyList()
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+/** Ruft Genre-Tags für eine Musikveröffentlichung ab. MusicBrainz hat diese Angaben nicht für jedes Album. */
+suspend fun lookupMusicGenres(releaseGroupId: String): String = withContext(Dispatchers.IO) {
+    if (releaseGroupId.isBlank()) return@withContext ""
+    var connection: HttpURLConnection? = null
+    try {
+        val url = URL("https://musicbrainz.org/ws/2/release-group/$releaseGroupId?inc=genres&fmt=json")
+        connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10000
+            readTimeout = 10000
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("User-Agent", "MeineSammlung/1.0 (personal Android collection app)")
+        }
+        if (connection.responseCode !in 200..299) return@withContext ""
+        val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val json = JSONObject(body)
+        val genres = json.optJSONArray("genres")
+        val names = mutableListOf<String>()
+        if (genres != null) {
+            for (i in 0 until genres.length()) {
+                val item = genres.optJSONObject(i) ?: continue
+                val name = item.optString("name").trim()
+                if (name.isNotBlank() && names.none { it.equals(name, ignoreCase = true) }) names.add(name)
+            }
+        }
+        if (names.isNotEmpty()) names.joinToString(", ") else {
+            // Ältere/anders gepflegte Einträge können Genres nur als Tags führen.
+            val tags = json.optJSONArray("tags")
+            if (tags != null) {
+                for (i in 0 until tags.length()) {
+                    val item = tags.optJSONObject(i) ?: continue
+                    val name = item.optString("name").trim()
+                    if (name.isNotBlank() && names.none { it.equals(name, ignoreCase = true) }) names.add(name)
+                }
+            }
+            names.take(5).joinToString(", ")
+        }
+    } catch (_: Exception) {
+        ""
+    } finally {
+        connection?.disconnect()
+    }
+}
+
+/** Sucht eine Musikveröffentlichung anhand ihres EAN/UPC-Barcodes.
+ * Gibt null zurück, wenn keine passende Veröffentlichung gefunden wurde oder
+ * die Anfrage fehlschlägt. Die gefundenen Daten werden nicht automatisch gespeichert.
+ */
+suspend fun lookupMusicRelease(barcode: String): MusicLookupResult? = withContext(Dispatchers.IO) {
+    if (barcode.isBlank()) return@withContext null
+
+    var connection: HttpURLConnection? = null
+    try {
+        val query = URLEncoder.encode("barcode:$barcode", "UTF-8")
+        val url = URL("https://musicbrainz.org/ws/2/release/?query=$query&fmt=json&limit=5")
+        connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10000
+            readTimeout = 10000
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("User-Agent", "MeineSammlung/1.0 (personal Android collection app)")
+        }
+
+        if (connection.responseCode !in 200..299) return@withContext null
+
+        val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val releases = JSONObject(body).optJSONArray("releases") ?: return@withContext null
+        if (releases.length() == 0) return@withContext null
+
+        // Bevorzugt einen Treffer, dessen Barcode exakt übereinstimmt.
+        var selected: JSONObject? = null
+        for (i in 0 until releases.length()) {
+            val candidate = releases.optJSONObject(i) ?: continue
+            if (candidate.optString("barcode") == barcode) {
+                selected = candidate
+                break
+            }
+        }
+        val release = selected ?: releases.optJSONObject(0) ?: return@withContext null
+        val title = release.optString("title").trim()
+        if (title.isBlank()) return@withContext null
+
+        val artistCredit = release.optJSONArray("artist-credit")
+        val artistNames = mutableListOf<String>()
+        if (artistCredit != null) {
+            for (i in 0 until artistCredit.length()) {
+                val credit = artistCredit.optJSONObject(i) ?: continue
+                val name = credit.optString("name").ifBlank {
+                    credit.optJSONObject("artist")?.optString("name").orEmpty()
+                }
+                if (name.isNotBlank()) artistNames.add(name)
+                val joinphrase = credit.optString("joinphrase")
+                if (joinphrase.isNotBlank() && artistNames.isNotEmpty()) {
+                    artistNames[artistNames.lastIndex] = artistNames.last() + joinphrase
+                }
+            }
+        }
+
+        val releaseId = release.optString("id").trim()
+        val coverUrl = if (releaseId.isNotBlank()) {
+            "https://coverartarchive.org/release/$releaseId/front-500"
+        } else {
+            ""
+        }
+
+        MusicLookupResult(
+            title = title,
+            artist = artistNames.joinToString("").trim(),
+            releaseDate = release.optString("date").trim(),
+            coverUrl = coverUrl
+        )
+    } catch (_: Exception) {
+        null
+    } finally {
+        connection?.disconnect()
+    }
+}
+
+
+/** Übernimmt einen manuell bestätigten MusicBrainz-Treffer für ein bestehendes Medium. */
+suspend fun applyMusicReleaseMetadata(
+    medium: MediumEntity,
+    release: MusicReleaseSearchResult,
+    replaceArtist: Boolean
+): MediumEntity {
+    val foundGenre = if (medium.genre.isBlank() && release.releaseGroupId.isNotBlank()) {
+        kotlinx.coroutines.delay(1100)
+        lookupMusicGenres(release.releaseGroupId)
+    } else ""
+
+    return medium.copy(
+        people = if (replaceArtist) release.artist else medium.people,
+        releaseDateGermany = medium.releaseDateGermany.ifBlank { release.releaseDate },
+        genre = medium.genre.ifBlank { foundGenre },
+        coverUrl = medium.coverUrl.ifBlank { release.coverUrl }
+    )
+}
+
+/** Ein Film- oder Serien-Treffer aus TMDB. */
+data class TmdbLookupResult(
+    val id: Int,
+    val title: String,
+    val originalTitle: String,
+    val year: String,
+    val mediaType: String,
+    val overview: String,
+    val genres: String,
+    val posterUrl: String
+)
+
+/**
+ * Sucht Filme und Serien anhand eines Titels. Der API-Key wird lokal über BuildConfig gelesen.
+ * TMDB unterstützt keine allgemeine Produktsuche nach DVD-/Blu-ray-Barcodes.
+ */
+suspend fun searchTmdbTitles(query: String): List<TmdbLookupResult> =
+    withContext(Dispatchers.IO) {
+        if (query.isBlank() || BuildConfig.TMDB_API_KEY.isBlank()) return@withContext emptyList()
+        var connection: HttpURLConnection? = null
+        try {
+            val encodedQuery = URLEncoder.encode(query.trim(), "UTF-8")
+            val url = URL(
+                "https://api.themoviedb.org/3/search/multi?query=$encodedQuery&include_adult=false&language=de-DE&page=1&api_key=${BuildConfig.TMDB_API_KEY}"
+            )
+            connection = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 10000
+                readTimeout = 10000
+                setRequestProperty("Accept", "application/json")
+            }
+            if (connection.responseCode !in 200..299) return@withContext emptyList()
+            val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val results = org.json.JSONObject(body).optJSONArray("results") ?: return@withContext emptyList()
+            val matches = mutableListOf<TmdbLookupResult>()
+            for (i in 0 until results.length()) {
+                val item = results.optJSONObject(i) ?: continue
+                val mediaType = item.optString("media_type")
+                if (mediaType != "movie" && mediaType != "tv") continue
+                val title = item.optString(if (mediaType == "movie") "title" else "name").trim()
+                if (title.isBlank()) continue
+                val original = item.optString(if (mediaType == "movie") "original_title" else "original_name").trim()
+                val date = item.optString(if (mediaType == "movie") "release_date" else "first_air_date")
+                val id = item.optInt("id")
+                val genreNames = fetchTmdbGenres(id, mediaType)
+                matches.add(
+                    TmdbLookupResult(
+                        id = id,
+                        title = title,
+                        originalTitle = original,
+                        year = date.take(4),
+                        mediaType = if (mediaType == "movie") "Film" else "Serie",
+                        overview = item.optString("overview").trim(),
+                        genres = genreNames,
+                        posterUrl = item.optString("poster_path").takeIf { it.isNotBlank() }?.let { "https://image.tmdb.org/t/p/w500$it" } ?: ""
+                    )
+                )
+            }
+            matches
+        } catch (_: Exception) {
+            emptyList()
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+
+/** Ruft die Detailinformationen ab, um Genre-Namen statt genre_ids zu erhalten. */
+private fun fetchTmdbGenres(id: Int, mediaType: String): String {
+    if (id <= 0) return ""
+    var connection: HttpURLConnection? = null
+    return try {
+        val endpoint = if (mediaType == "movie") "movie" else "tv"
+        val url = URL(
+            "https://api.themoviedb.org/3/$endpoint/$id?language=de-DE&api_key=${BuildConfig.TMDB_API_KEY}"
+        )
+        connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10000
+            readTimeout = 10000
+            setRequestProperty("Accept", "application/json")
+        }
+        if (connection.responseCode !in 200..299) return ""
+        val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val genres = JSONObject(body).optJSONArray("genres") ?: return ""
+        val names = mutableListOf<String>()
+        for (i in 0 until genres.length()) {
+            val genre = genres.optJSONObject(i) ?: continue
+            val name = genre.optString("name").trim()
+            if (name.isNotBlank()) names.add(name)
+        }
+        names.joinToString(", ")
+    } catch (_: Exception) {
+        ""
+    } finally {
+        connection?.disconnect()
+    }
+}
+
+/** Ergänzt nur leere Felder. Treffer werden nur übernommen, wenn der Titel exakt passt. */
+suspend fun enrichMediumMetadata(
+    medium: MediumEntity,
+    onArtistMismatch: ((MusicReleaseSearchResult) -> Unit)? = null
+): MediumEntity {
+    fun normalize(value: String): String = value.lowercase()
+        .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+        .trim()
+        .replace(Regex("\\s+"), " ")
+
+    val currentTitle = normalize(medium.title)
+    if (currentTitle.isBlank()) return medium
+
+    if (medium.mediumType.equals("CD", ignoreCase = true)) {
+        val results = searchMusicReleases(medium.title, medium.people)
+        // Ein gespeicherter Titel darf auch nur der Anfang des vollständigen
+        // Veröffentlichungstitels sein (z. B. "Schenk mir eine Nacht" vs.
+        // "Schenk mir eine Nacht - Ihre schönsten Lovesongs").
+        val titleMatches = results.filter { result ->
+            val candidateTitle = normalize(result.title)
+            candidateTitle == currentTitle ||
+                    candidateTitle.startsWith("$currentTitle ") ||
+                    candidateTitle.contains(currentTitle)
+        }
+        if (titleMatches.isEmpty()) return medium
+        val currentArtist = normalize(medium.people)
+        val best = if (currentArtist.isNotBlank()) {
+            titleMatches.firstOrNull { result ->
+                val candidateArtist = normalize(result.artist)
+                candidateArtist == currentArtist ||
+                        candidateArtist.contains(currentArtist) ||
+                        currentArtist.contains(candidateArtist)
+            } ?: run {
+                // Titel passt, aber der gespeicherte Künstler nicht: Kandidaten
+                // zur manuellen Bestätigung melden, statt stillschweigend zu raten.
+                titleMatches.firstOrNull { it.artist.isNotBlank() }?.let { candidate ->
+                    onArtistMismatch?.invoke(candidate)
+                }
+                return medium
+            }
+        } else {
+            // Ohne gespeicherten Interpreten nur fortfahren, wenn die passenden
+            // Titel zu genau einem Interpreten gehören.
+            val artists = titleMatches.map { normalize(it.artist) }.filter { it.isNotBlank() }.distinct()
+            if (artists.size != 1) return medium
+            titleMatches.firstOrNull { normalize(it.artist) == artists.first() } ?: return medium
+        }
+        val foundGenre = if (medium.genre.isBlank()) {
+            kotlinx.coroutines.delay(1100)
+            lookupMusicGenres(best.releaseGroupId)
+        } else ""
+        return medium.copy(
+            people = medium.people.ifBlank { best.artist },
+            releaseDateGermany = medium.releaseDateGermany.ifBlank { best.releaseDate },
+            genre = medium.genre.ifBlank { foundGenre },
+            coverUrl = medium.coverUrl.ifBlank { best.coverUrl }
+        )
+    }
+
+    val results = searchTmdbTitles(medium.title)
+    val exactMatches = results.filter {
+        normalize(it.title) == currentTitle || normalize(it.originalTitle) == currentTitle
+    }
+    if (exactMatches.isEmpty()) return medium
+    // If several exact matches remain (e.g. a film and a series), do not guess.
+    val distinctMatches = exactMatches.distinctBy { "${it.mediaType}:${it.id}" }
+    if (distinctMatches.size != 1) return medium
+    val best = distinctMatches.first()
+    return medium.copy(
+        originalTitle = medium.originalTitle.ifBlank { best.originalTitle },
+        genre = medium.genre.ifBlank { best.genres },
+        releaseDateGermany = medium.releaseDateGermany.ifBlank { best.year },
+        coverUrl = medium.coverUrl.ifBlank { best.posterUrl },
+    )
+}

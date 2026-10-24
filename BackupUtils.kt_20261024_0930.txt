@@ -1,0 +1,78 @@
+package com.example.meinesammlung
+
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * Erstellt eine portable JSON-Sicherung aller Medien.
+ * Datenbank-IDs werden nicht als Identität verwendet, damit beim Import
+ * keine bestehenden Einträge durch kollidierende IDs überschrieben werden.
+ */
+fun createBackupJson(media: List<MediumEntity>): String {
+    val root = JSONObject()
+    root.put("format", "MeineSammlungBackup")
+    root.put("version", 1)
+    root.put("createdAt", System.currentTimeMillis())
+
+    val items = JSONArray()
+    media.forEach { medium ->
+        items.put(
+            JSONObject().apply {
+                put("title", medium.title)
+                put("originalTitle", medium.originalTitle)
+                put("mediumType", medium.mediumType)
+                put("genre", medium.genre)
+                put("releaseDateGermany", medium.releaseDateGermany)
+                put("people", medium.people)
+                put("barcode", medium.barcode)
+                put("edition", medium.edition)
+                put("notes", medium.notes)
+                put("coverUrl", medium.coverUrl)
+            }
+        )
+    }
+    root.put("media", items)
+    return root.toString(2)
+}
+
+/**
+ * Liest eine Sicherungsdatei. Fehlerhafte Dateien werden abgelehnt,
+ * statt stillschweigend unvollständige Einträge zu importieren.
+ */
+fun parseBackupJson(json: String): List<MediumEntity> {
+    val root = JSONObject(json)
+    require(root.optString("format") == "MeineSammlungBackup") {
+        "Das ist keine Sicherungsdatei von Meine Sammlung."
+    }
+    require(root.optInt("version", -1) == 1) {
+        "Diese Sicherungsversion wird nicht unterstützt."
+    }
+
+    val items = root.optJSONArray("media")
+        ?: throw IllegalArgumentException("In der Datei fehlt die Medienliste.")
+
+    val result = mutableListOf<MediumEntity>()
+    for (index in 0 until items.length()) {
+        val item = items.optJSONObject(index)
+            ?: throw IllegalArgumentException("Ein Eintrag in der Sicherung ist ungültig.")
+        val title = item.optString("title").trim()
+        if (title.isBlank()) {
+            throw IllegalArgumentException("Ein Eintrag hat keinen Titel. Die Sicherung wurde nicht importiert.")
+        }
+
+        result += MediumEntity(
+            id = 0,
+            title = title,
+            originalTitle = item.optString("originalTitle"),
+            mediumType = item.optString("mediumType", "DVD").ifBlank { "DVD" },
+            genre = item.optString("genre"),
+            releaseDateGermany = item.optString("releaseDateGermany"),
+            people = item.optString("people"),
+            barcode = item.optString("barcode"),
+            edition = item.optString("edition"),
+            notes = item.optString("notes"),
+            coverUrl = item.optString("coverUrl")
+        )
+    }
+    return result
+}

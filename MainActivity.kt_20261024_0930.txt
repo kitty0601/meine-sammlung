@@ -1,0 +1,1325 @@
+package com.example.meinesammlung
+
+import android.os.Bundle
+import android.net.Uri
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.draw.clip
+import coil.compose.AsyncImage
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+
+private val Background = Color(0xFF101820)
+private val Panel = Color(0xFF1B2935)
+private val Green = Color(0xFF75D69A)
+private val SoftWhite = Color(0xFFF4F5F6)
+private val Muted = Color(0xFFB6C2CC)
+
+private val coverColors = listOf(
+    Color(0xFF536B38), Color(0xFF526F91),
+    Color(0xFFB78C57), Color(0xFFCB6D25),
+    Color(0xFF477DAD), Color(0xFF6240A5)
+)
+
+private data class ArtistMismatchPrompt(
+    val medium: MediumEntity,
+    val release: MusicReleaseSearchResult
+)
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        window.statusBarColor = android.graphics.Color.rgb(16, 24, 32)
+        window.navigationBarColor = android.graphics.Color.rgb(16, 24, 32)
+
+        setContent {
+            MaterialTheme(
+                colorScheme = darkColorScheme(
+                    primary = Green,
+                    background = Background,
+                    surface = Panel,
+                    onBackground = SoftWhite,
+                    onSurface = SoftWhite
+                )
+            ) {
+                CollectionApp()
+            }
+        }
+    }
+}
+
+@Composable
+fun CollectionApp() {
+    val context = LocalContext.current
+    val dao = remember {
+        AppDatabase.getDatabase(context).mediumDao()
+    }
+    val scope = rememberCoroutineScope()
+    val media by dao.getAll().collectAsState(initial = emptyList())
+
+    var search by remember { mutableStateOf("") }
+    var selectedType by remember { mutableStateOf("Alle") }
+    var showAddDialog by remember { mutableStateOf(false) }
+    var showEditDialog by remember { mutableStateOf(false) }
+    var selectedItem by remember { mutableStateOf<MediumEntity?>(null) }
+    var pendingMedium by remember { mutableStateOf<MediumEntity?>(null) }
+    var duplicateWarning by remember { mutableStateOf(false) }
+    var pendingImport by remember { mutableStateOf<List<MediumEntity>?>(null) }
+    var pendingImportLabel by remember { mutableStateOf("Sicherung") }
+    var backupError by remember { mutableStateOf<String?>(null) }
+    var isEnriching by remember { mutableStateOf(false) }
+    var enrichmentProgress by remember { mutableStateOf(0) }
+    var enrichmentTotal by remember { mutableStateOf(0) }
+    var enrichmentMessage by remember { mutableStateOf("") }
+    var pendingArtistMismatch by remember { mutableStateOf<ArtistMismatchPrompt?>(null) }
+    var artistMismatchQueue by remember { mutableStateOf<List<ArtistMismatchPrompt>>(emptyList()) }
+    var enrichmentSummary by remember { mutableStateOf<String?>(null) }
+    var enrichmentUpdatedCount by remember { mutableStateOf(0) }
+    var enrichmentNotFoundCount by remember { mutableStateOf(0) }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                try {
+                    val json = createBackupJson(media)
+                    context.contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use {
+                        it.write(json)
+                    } ?: throw IllegalStateException("Die Sicherungsdatei konnte nicht geöffnet werden.")
+                    Toast.makeText(context, "Sicherung mit ${media.size} Medien erstellt.", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    backupError = "Die Sicherung konnte nicht erstellt werden: ${e.localizedMessage ?: "Unbekannter Fehler"}"
+                }
+            }
+        }
+    }
+
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                try {
+                    val json = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                        ?: throw IllegalStateException("Die Datei konnte nicht gelesen werden.")
+                    pendingImport = parseBackupJson(json)
+                    pendingImportLabel = "Sicherung"
+                    if (pendingImport.isNullOrEmpty()) {
+                        backupError = "Die Sicherungsdatei enthält keine Medien."
+                    }
+                } catch (e: Exception) {
+                    backupError = e.localizedMessage ?: "Die Sicherungsdatei konnte nicht eingelesen werden."
+                }
+            }
+        }
+    }
+
+    val excelImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                try {
+                    val stream = context.contentResolver.openInputStream(uri)
+                        ?: throw IllegalStateException("Die Excel-Datei konnte nicht geöffnet werden.")
+                    pendingImport = parseExcelMedia(stream)
+                    pendingImportLabel = "Excel-Liste"
+                    if (pendingImport.isNullOrEmpty()) {
+                        backupError = "Die Excel-Datei enthält keine Medieneinträge."
+                    }
+                } catch (e: Exception) {
+                    backupError = e.localizedMessage ?: "Die Excel-Datei konnte nicht eingelesen werden. Bitte wähle eine .xlsx-Datei aus."
+                }
+            }
+        }
+    }
+
+    val filteredMedia = media.filter { item ->
+        val matchesSearch = listOf(
+            item.title, item.originalTitle, item.people,
+            item.genre, item.barcode
+        ).any { it.contains(search, ignoreCase = true) }
+
+        val matchesType =
+            selectedType == "Alle" || item.mediumType == selectedType
+
+        matchesSearch && matchesType
+    }
+
+    Scaffold(
+        containerColor = Background,
+        bottomBar = {
+            NavigationBar(containerColor = Color(0xFF17232E)) {
+                NavigationBarItem(
+                    selected = selectedItem == null,
+                    onClick = { selectedItem = null },
+                    icon = { Text("⌂", fontSize = 23.sp) },
+                    label = { Text("Sammlung") },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = Green,
+                        selectedTextColor = Green,
+                        indicatorColor = Color(0xFF294437)
+                    )
+                )
+                NavigationBarItem(
+                    selected = false,
+                    onClick = { showAddDialog = true },
+                    icon = { Text("＋", fontSize = 23.sp) },
+                    label = { Text("Hinzufügen") }
+                )
+            }
+        }
+    ) { padding ->
+        if (selectedItem != null) {
+            MediumDetails(
+                item = selectedItem!!,
+                onBack = { selectedItem = null },
+                onEdit = { showEditDialog = true },
+                onDelete = {
+                    val item = selectedItem!!
+                    scope.launch {
+                        dao.delete(item)
+                        selectedItem = null
+                        Toast.makeText(
+                            context,
+                            "Medium gelöscht",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                },
+                modifier = Modifier.padding(padding)
+            )
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp)
+            ) {
+                Spacer(Modifier.height(20.dp))
+
+                Text(
+                    "Meine Sammlung",
+                    fontSize = 27.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = SoftWhite
+                )
+                Text(
+                    "Deine Medien. Immer dabei.",
+                    fontSize = 13.sp,
+                    color = Muted
+                )
+
+                Spacer(Modifier.height(22.dp))
+
+                OutlinedTextField(
+                    value = search,
+                    onValueChange = { search = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = {
+                        Text("Titel, Schauspieler, Barcode ...")
+                    },
+                    singleLine = true,
+                    shape = RoundedCornerShape(16.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Green,
+                        unfocusedBorderColor = Color(0xFF40505D),
+                        focusedTextColor = SoftWhite,
+                        unfocusedTextColor = SoftWhite,
+                        cursorColor = Green
+                    )
+                )
+
+                Spacer(Modifier.height(12.dp))
+
+                Button(
+                    onClick = { showAddDialog = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Green
+                    )
+                ) {
+                    Text(
+                        "＋ Medium hinzufügen",
+                        color = Background,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Spacer(Modifier.height(22.dp))
+
+                Text(
+                    "Deine Medien (${media.size})",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { exportLauncher.launch("meine_sammlung_sicherung.json") },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Sicherung exportieren")
+                    }
+                    OutlinedButton(
+                        onClick = { importLauncher.launch(arrayOf("application/json", "text/*")) },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Sicherung importieren")
+                    }
+                }
+                OutlinedButton(
+                    onClick = {
+                        excelImportLauncher.launch(
+                            arrayOf("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.ms-excel")
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Excel-Liste importieren (.xlsx)")
+                }
+
+                OutlinedButton(
+                    enabled = !isEnriching && media.any { it.coverUrl.isBlank() || it.genre.isBlank() || it.originalTitle.isBlank() || it.releaseDateGermany.isBlank() || (it.mediumType == "CD" && it.people.isBlank()) },
+                    onClick = {
+                        val targets = media.filter {
+                            it.coverUrl.isBlank() || it.genre.isBlank() || it.originalTitle.isBlank() ||
+                                    it.releaseDateGermany.isBlank() || (it.mediumType == "CD" && it.people.isBlank())
+                        }
+                        scope.launch {
+                            isEnriching = true
+                            enrichmentProgress = 0
+                            enrichmentTotal = targets.size
+                            var updatedCount = 0
+                            var notFoundCount = 0
+                            val artistMismatches = mutableListOf<ArtistMismatchPrompt>()
+                            try {
+                                targets.forEachIndexed { index, item ->
+                                    enrichmentMessage = "Prüfe: ${item.title}"
+                                    var mismatchCandidate: MusicReleaseSearchResult? = null
+                                    val enriched = enrichMediumMetadata(item) { candidate ->
+                                        mismatchCandidate = candidate
+                                    }
+                                    if (enriched != item) {
+                                        dao.update(enriched)
+                                        updatedCount++
+                                    } else if (mismatchCandidate != null) {
+                                        artistMismatches.add(ArtistMismatchPrompt(item, mismatchCandidate!!))
+                                    } else {
+                                        notFoundCount++
+                                    }
+                                    enrichmentProgress = index + 1
+                                    // MusicBrainz requests are deliberately spaced to respect its rate limit.
+                                    if (item.mediumType.equals("CD", ignoreCase = true) && index < targets.lastIndex) delay(1100)
+                                }
+                                enrichmentUpdatedCount = updatedCount
+                                enrichmentNotFoundCount = notFoundCount
+                                artistMismatchQueue = artistMismatches.drop(1)
+                                if (artistMismatches.isNotEmpty()) {
+                                    pendingArtistMismatch = artistMismatches.first()
+                                } else {
+                                    enrichmentSummary = "Prüfung abgeschlossen.\n\nAktualisiert: $updatedCount\nOhne Ergänzung: $notFoundCount"
+                                }
+                            } catch (e: Exception) {
+                                backupError = "Die Ergänzung wurde unterbrochen: ${e.localizedMessage ?: "Unbekannter Fehler"}"
+                            } finally {
+                                isEnriching = false
+                                enrichmentMessage = ""
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    if (isEnriching) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Ergänze Angaben ($enrichmentProgress/$enrichmentTotal)")
+                    } else {
+                        Text("Fehlende Angaben ergänzen")
+                    }
+                }
+                if (isEnriching) {
+                    Text(enrichmentMessage, color = Muted, fontSize = 12.sp)
+                    LinearProgressIndicator(
+                        progress = { if (enrichmentTotal == 0) 0f else enrichmentProgress.toFloat() / enrichmentTotal.toFloat() },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                Spacer(Modifier.height(10.dp))
+
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("Alle", "CD", "DVD", "Blu-ray").forEach { type ->
+                        FilterChip(
+                            selected = selectedType == type,
+                            onClick = { selectedType = type },
+                            label = { Text(type) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Green,
+                                selectedLabelColor = Background,
+                                labelColor = SoftWhite
+                            )
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                if (filteredMedia.isEmpty()) {
+                    Text(
+                        if (search.isBlank() && selectedType == "Alle") {
+                            "Deine Sammlung ist noch leer. Füge dein erstes Medium hinzu!"
+                        } else {
+                            "Keine passenden Medien gefunden."
+                        },
+                        color = Muted,
+                        modifier = Modifier.padding(vertical = 20.dp)
+                    )
+                } else {
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(2),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 10000.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                        userScrollEnabled = false
+                    ) {
+                        items(filteredMedia, key = { it.id }) { item ->
+                            MediumCard(item) {
+                                selectedItem = item
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(24.dp))
+            }
+        }
+    }
+
+    if (showAddDialog) {
+        AddMediumDialog(
+            onDismiss = { showAddDialog = false },
+            onSave = { item ->
+                scope.launch {
+                    val barcode = item.barcode.trim()
+                    val barcodeDuplicate = if (barcode.isNotEmpty()) {
+                        dao.findByBarcode(barcode)
+                    } else {
+                        null
+                    }
+
+                    val possibleDuplicate = barcodeDuplicate
+                        ?: dao.findPossibleDuplicate(
+                            title = item.title.trim(),
+                            people = item.people.trim(),
+                            mediumType = item.mediumType
+                        )
+
+                    if (possibleDuplicate != null) {
+                        pendingMedium = item
+                        duplicateWarning = true
+                        showAddDialog = false
+                    } else {
+                        dao.insert(item)
+                        Toast.makeText(
+                            context,
+                            "Medium gespeichert!",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        showAddDialog = false
+                    }
+                }
+            }
+        )
+    }
+
+    if (duplicateWarning && pendingMedium != null) {
+        AlertDialog(
+            onDismissRequest = {
+                duplicateWarning = false
+                pendingMedium = null
+            },
+            containerColor = Panel,
+            title = {
+                Text("Möglicherweise bereits vorhanden", color = SoftWhite)
+            },
+            text = {
+                val medium = pendingMedium!!
+                Text(
+                    "Ein ähnliches Medium ist bereits in deiner Sammlung:\n\n" +
+                            "Titel: ${medium.title}\n" +
+                            "Interpret: ${medium.people.ifBlank { "Nicht angegeben" }}\n" +
+                            "Typ: ${medium.mediumType}\n\n" +
+                            "Möchtest du es trotzdem hinzufügen?",
+                    color = SoftWhite
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val medium = pendingMedium
+                        if (medium != null) {
+                            scope.launch {
+                                dao.insert(medium)
+                                Toast.makeText(
+                                    context,
+                                    "Medium gespeichert!",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                duplicateWarning = false
+                                pendingMedium = null
+                            }
+                        }
+                    }
+                ) {
+                    Text("Trotzdem hinzufügen", color = Green)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        duplicateWarning = false
+                        pendingMedium = null
+                    }
+                ) {
+                    Text("Abbrechen", color = Muted)
+                }
+            }
+        )
+    }
+
+
+    if (pendingImport != null) {
+        val importItems = pendingImport.orEmpty()
+        AlertDialog(
+            onDismissRequest = { pendingImport = null },
+            containerColor = Panel,
+            title = { Text("${pendingImportLabel} importieren?", color = SoftWhite) },
+            text = {
+                val possibleDuplicates = importItems.count { incoming ->
+                    media.any { existing ->
+                        existing.title.trim().equals(incoming.title.trim(), ignoreCase = true) &&
+                                existing.mediumType.equals(incoming.mediumType, ignoreCase = true) &&
+                                (incoming.people.isBlank() || existing.people.trim().equals(incoming.people.trim(), ignoreCase = true))
+                    }
+                }
+                Column(
+                    modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text("${importItems.size} Medien wurden erkannt.", color = SoftWhite)
+                    if (possibleDuplicates > 0) {
+                        Text("Mögliche bereits vorhandene Einträge: $possibleDuplicates. Diese werden beim Import übersprungen.", color = Green)
+                    } else {
+                        Text("In deiner aktuellen Sammlung wurden anhand von Titel und Medientyp keine offensichtlichen Duplikate gefunden.", color = Muted)
+                    }
+                    Text("Vorschau:", color = SoftWhite, fontWeight = FontWeight.Bold)
+                    importItems.take(8).forEach { item ->
+                        Text("• ${item.title} — ${item.people.ifBlank { "Interpret nicht angegeben" }} (${item.mediumType})", color = SoftWhite, fontSize = 13.sp)
+                    }
+                    if (importItems.size > 8) Text("… und ${importItems.size - 8} weitere", color = Muted, fontSize = 12.sp)
+                    Text(
+                        "Bestehende Medien werden nicht überschrieben oder gelöscht." +
+                                if (pendingImportLabel == "Excel-Liste") " Genre, Erscheinungsdatum, Barcode und Cover können anschließend ergänzt werden." else "",
+                        color = Muted
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val itemsToImport = importItems
+                        pendingImport = null
+                        scope.launch {
+                            var imported = 0
+                            var skipped = 0
+                            try {
+                                itemsToImport.forEach { item ->
+                                    val barcode = item.barcode.trim()
+                                    val existingByBarcode = if (barcode.isNotEmpty()) dao.findByBarcode(barcode) else null
+                                    val existingByTitle = dao.findPossibleDuplicate(
+                                        title = item.title.trim(),
+                                        people = item.people.trim(),
+                                        mediumType = item.mediumType
+                                    )
+                                    if (existingByBarcode != null || existingByTitle != null) {
+                                        skipped++
+                                    } else {
+                                        dao.insert(item.copy(id = 0))
+                                        imported++
+                                    }
+                                }
+                                Toast.makeText(
+                                    context,
+                                    "Import abgeschlossen: $imported hinzugefügt, $skipped übersprungen.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            } catch (e: Exception) {
+                                backupError = "Der Import wurde nach $imported Einträgen unterbrochen. Bitte prüfe deine Sammlung."
+                            }
+                        }
+                    }
+                ) { Text("Importieren", color = Green) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingImport = null }) {
+                    Text("Abbrechen", color = Muted)
+                }
+            }
+        )
+    }
+
+    if (showEditDialog && selectedItem != null) {
+        EditMediumDialog(
+            item = selectedItem!!,
+            onDismiss = { showEditDialog = false },
+            onSave = { updatedItem ->
+                scope.launch {
+                    dao.update(updatedItem)
+                    selectedItem = updatedItem
+                    showEditDialog = false
+                    Toast.makeText(context, "Änderungen gespeichert.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        )
+    }
+
+    if (pendingArtistMismatch != null) {
+        val prompt = pendingArtistMismatch!!
+        AlertDialog(
+            onDismissRequest = {
+                // Wegklicken entspricht bewusst dem Beibehalten des eigenen Eintrags.
+                enrichmentNotFoundCount += 1
+                val next = artistMismatchQueue.firstOrNull()
+                artistMismatchQueue = artistMismatchQueue.drop(1)
+                pendingArtistMismatch = next
+                if (next == null) {
+                    enrichmentSummary = "Prüfung abgeschlossen.\n\nAktualisiert: $enrichmentUpdatedCount\nOhne Ergänzung: $enrichmentNotFoundCount"
+                }
+            },
+            containerColor = Panel,
+            title = { Text("Künstler weicht ab", color = SoftWhite) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Der Titel passt zu einem gefundenen Treffer, aber der Künstlername unterscheidet sich.", color = SoftWhite)
+                    Text("Dein Eintrag: ${prompt.medium.people}", color = Muted)
+                    Text("Gefundener Künstler: ${prompt.release.artist}", color = Green, fontWeight = FontWeight.Bold)
+                    Text("Gefundener Titel: ${prompt.release.title}", color = SoftWhite)
+                    Text("Möchtest du den Künstlernamen ändern und die fehlenden Angaben dieses Treffers übernehmen?", color = SoftWhite)
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            try {
+                                val updated = applyMusicReleaseMetadata(prompt.medium, prompt.release, replaceArtist = true)
+                                dao.update(updated)
+                                enrichmentUpdatedCount += 1
+                            } catch (e: Exception) {
+                                backupError = "Der Treffer konnte nicht übernommen werden: ${e.localizedMessage ?: "Unbekannter Fehler"}"
+                                enrichmentNotFoundCount += 1
+                            }
+                            val next = artistMismatchQueue.firstOrNull()
+                            artistMismatchQueue = artistMismatchQueue.drop(1)
+                            pendingArtistMismatch = next
+                            if (next == null) {
+                                enrichmentSummary = "Prüfung abgeschlossen.\n\nAktualisiert: $enrichmentUpdatedCount\nOhne Ergänzung: $enrichmentNotFoundCount"
+                            }
+                        }
+                    }
+                ) { Text("Künstler übernehmen", color = Green) }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        enrichmentNotFoundCount += 1
+                        val next = artistMismatchQueue.firstOrNull()
+                        artistMismatchQueue = artistMismatchQueue.drop(1)
+                        pendingArtistMismatch = next
+                        if (next == null) {
+                            enrichmentSummary = "Prüfung abgeschlossen.\n\nAktualisiert: $enrichmentUpdatedCount\nOhne Ergänzung: $enrichmentNotFoundCount"
+                        }
+                    }
+                ) { Text("Beibehalten", color = Muted) }
+            }
+        )
+    }
+
+    if (enrichmentSummary != null) {
+        AlertDialog(
+            onDismissRequest = { enrichmentSummary = null },
+            containerColor = Panel,
+            title = { Text("Metadatenprüfung abgeschlossen", color = SoftWhite) },
+            text = { Text(enrichmentSummary.orEmpty(), color = SoftWhite) },
+            confirmButton = {
+                TextButton(onClick = { enrichmentSummary = null }) {
+                    Text("OK", color = Green)
+                }
+            }
+        )
+    }
+
+    if (backupError != null) {
+        AlertDialog(
+            onDismissRequest = { backupError = null },
+            containerColor = Panel,
+            title = { Text("Sicherung", color = SoftWhite) },
+            text = { Text(backupError.orEmpty(), color = SoftWhite) },
+            confirmButton = {
+                TextButton(onClick = { backupError = null }) {
+                    Text("OK", color = Green)
+                }
+            }
+        )
+    }
+}
+
+@Composable
+fun EditMediumDialog(
+    item: MediumEntity,
+    onDismiss: () -> Unit,
+    onSave: (MediumEntity) -> Unit
+) {
+    var title by remember(item.id) { mutableStateOf(item.title) }
+    var originalTitle by remember(item.id) { mutableStateOf(item.originalTitle) }
+    var type by remember(item.id) { mutableStateOf(item.mediumType) }
+    var genre by remember(item.id) { mutableStateOf(item.genre) }
+    var releaseDate by remember(item.id) { mutableStateOf(item.releaseDateGermany) }
+    var people by remember(item.id) { mutableStateOf(item.people) }
+    var barcode by remember(item.id) { mutableStateOf(item.barcode) }
+    var edition by remember(item.id) { mutableStateOf(item.edition) }
+    var notes by remember(item.id) { mutableStateOf(item.notes) }
+    var coverUrl by remember(item.id) { mutableStateOf(item.coverUrl) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Panel,
+        title = { Text("Medium bearbeiten", color = SoftWhite) },
+        text = {
+            Column(
+                modifier = Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("Titel *") }, singleLine = true)
+                OutlinedTextField(value = originalTitle, onValueChange = { originalTitle = it }, label = { Text("Originaltitel") }, singleLine = true)
+                Text("Medientyp", color = Muted)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    listOf("CD", "DVD", "Blu-ray").forEach { option ->
+                        FilterChip(selected = type == option, onClick = { type = option }, label = { Text(option) })
+                    }
+                }
+                OutlinedTextField(value = people, onValueChange = { people = it }, label = { Text("Schauspieler / Künstler") })
+                OutlinedTextField(value = genre, onValueChange = { genre = it }, label = { Text("Genre") }, singleLine = true)
+                OutlinedTextField(value = releaseDate, onValueChange = { releaseDate = it }, label = { Text("Erscheinungsdatum DE") }, singleLine = true)
+                OutlinedTextField(value = barcode, onValueChange = { barcode = it }, label = { Text("Barcode") }, singleLine = true)
+                OutlinedTextField(value = edition, onValueChange = { edition = it }, label = { Text("Ausgabe") }, singleLine = true)
+                OutlinedTextField(value = coverUrl, onValueChange = { coverUrl = it }, label = { Text("Cover-URL") }, singleLine = true)
+                OutlinedTextField(value = notes, onValueChange = { notes = it }, label = { Text("Notizen") }, minLines = 2)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                if (title.isNotBlank()) onSave(item.copy(
+                    title = title.trim(),
+                    originalTitle = originalTitle.trim(),
+                    mediumType = type,
+                    genre = genre.trim(),
+                    releaseDateGermany = releaseDate.trim(),
+                    people = people.trim(),
+                    barcode = barcode.trim(),
+                    edition = edition.trim(),
+                    notes = notes.trim(),
+                    coverUrl = coverUrl.trim()
+                ))
+            }) { Text("Speichern", color = Green) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Abbrechen", color = Muted) }
+        }
+    )
+}
+
+
+@Composable
+fun AddMediumDialog(
+    onDismiss: () -> Unit,
+    onSave: (MediumEntity) -> Unit
+) {
+    val context = LocalContext.current
+    var title by remember { mutableStateOf("") }
+    var originalTitle by remember { mutableStateOf("") }
+    var type by remember { mutableStateOf("CD") }
+    var genre by remember { mutableStateOf("") }
+    var releaseDate by remember { mutableStateOf("") }
+    var coverUrl by remember { mutableStateOf("") }
+    var people by remember { mutableStateOf("") }
+    var barcode by remember { mutableStateOf("") }
+    var isLookingUp by remember { mutableStateOf(false) }
+    var isSearchingFilms by remember { mutableStateOf(false) }
+    var filmResults by remember { mutableStateOf<List<TmdbLookupResult>>(emptyList()) }
+    var showFilmResults by remember { mutableStateOf(false) }
+    var isSearchingMusic by remember { mutableStateOf(false) }
+    var musicResults by remember { mutableStateOf<List<MusicReleaseSearchResult>>(emptyList()) }
+    var showMusicResults by remember { mutableStateOf(false) }
+    val lookupScope = rememberCoroutineScope()
+    var titleSearchJob by remember { mutableStateOf<Job?>(null) }
+    var musicSearchJob by remember { mutableStateOf<Job?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Panel,
+        title = {
+            Text("Neues Medium", color = SoftWhite)
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 480.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = title,
+                        onValueChange = { newTitle ->
+                            title = newTitle
+                            titleSearchJob?.cancel()
+                            filmResults = emptyList()
+                            showFilmResults = false
+
+                            val query = newTitle.trim()
+                            val shouldSearch = type != "CD" && query.length >= 2
+                            isSearchingFilms = shouldSearch
+
+                            // Bei Filmen/Serien automatisch suchen, sobald die Eingabe kurz pausiert.
+                            if (shouldSearch) {
+                                titleSearchJob = lookupScope.launch {
+                                    delay(650)
+                                    try {
+                                        val results = searchTmdbTitles(query)
+
+                                        // Nur Ergebnisse für die zuletzt eingegebene Titelfassung anzeigen.
+                                        if (title.trim() == query && type != "CD") {
+                                            filmResults = results
+                                            showFilmResults = results.isNotEmpty()
+                                        }
+                                    } catch (e: kotlinx.coroutines.CancellationException) {
+                                        throw e
+                                    } catch (_: Exception) {
+                                        // Bei einem Netzwerkfehler bleibt die Eingabemaske bedienbar.
+                                    } finally {
+                                        if (title.trim() == query) {
+                                            isSearchingFilms = false
+                                        }
+                                    }
+                                }
+                            }
+                            // CD-Suche automatisch starten, sobald die Eingabe kurz pausiert.
+                            musicSearchJob?.cancel()
+                            if (type == "CD" && query.length >= 2) {
+                                isSearchingMusic = true
+                                musicSearchJob = lookupScope.launch {
+                                    delay(500)
+                                    try {
+                                        val results = searchMusicReleases(query, people)
+                                        if (type == "CD" && title.trim() == query) {
+                                            musicResults = results
+                                            showMusicResults = results.isNotEmpty()
+                                        }
+                                    } catch (e: kotlinx.coroutines.CancellationException) {
+                                        throw e
+                                    } catch (_: Exception) {
+                                    } finally {
+                                        if (title.trim() == query && type == "CD") isSearchingMusic = false
+                                    }
+                                }
+                            } else {
+                                isSearchingMusic = false
+                            }
+                        },
+                        label = { Text("Titel *") },
+                        singleLine = true
+                    )
+
+                    if ((isSearchingFilms && type != "CD") || (isSearchingMusic && type == "CD")) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(24.dp),
+                            strokeWidth = 2.dp,
+                            color = Green
+                        )
+                    }
+                }
+                if (type == "CD") {
+                    OutlinedTextField(
+                        value = people,
+                        onValueChange = { newArtist ->
+                            people = newArtist
+                            musicSearchJob?.cancel()
+                            val queryTitle = title.trim()
+                            if (queryTitle.length >= 2) {
+                                isSearchingMusic = true
+                                musicSearchJob = lookupScope.launch {
+                                    delay(500)
+                                    try {
+                                        val results = searchMusicReleases(queryTitle, newArtist)
+                                        if (type == "CD" && title.trim() == queryTitle && people == newArtist) {
+                                            musicResults = results
+                                            showMusicResults = results.isNotEmpty()
+                                        }
+                                    } catch (e: kotlinx.coroutines.CancellationException) {
+                                        throw e
+                                    } catch (_: Exception) {
+                                    } finally {
+                                        if (title.trim() == queryTitle && people == newArtist && type == "CD") isSearchingMusic = false
+                                    }
+                                }
+                            } else {
+                                isSearchingMusic = false
+                            }
+                        },
+                        label = { Text("Interpret / Künstler") },
+                        singleLine = true
+                    )
+                }
+                OutlinedTextField(
+                    value = originalTitle,
+                    onValueChange = { originalTitle = it },
+                    label = { Text("Originaltitel (optional)") },
+                    singleLine = true
+                )
+
+                Text("Medientyp", color = Muted)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    listOf("CD", "DVD", "Blu-ray").forEach { option ->
+                        FilterChip(
+                            selected = type == option,
+                            onClick = {
+                                type = option
+                                if (option == "CD") {
+                                    titleSearchJob?.cancel()
+                                    isSearchingFilms = false
+                                    showFilmResults = false
+                                } else {
+                                    musicSearchJob?.cancel()
+                                    isSearchingMusic = false
+                                    showMusicResults = false
+                                }
+                            },
+                            label = { Text(option) }
+                        )
+                    }
+                }
+
+                OutlinedTextField(
+                    value = genre,
+                    onValueChange = { genre = it },
+                    label = { Text("Genre") },
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = releaseDate,
+                    onValueChange = { releaseDate = it },
+                    label = { Text("Erscheinungsdatum DE") },
+                    placeholder = { Text("z. B. 23.10.2026") },
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = barcode,
+                    onValueChange = { barcode = it },
+                    label = { Text("Barcode (optional)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedButton(
+                    onClick = {
+                        GmsBarcodeScanning.getClient(context)
+                            .startScan()
+                            .addOnSuccessListener { result ->
+                                result.rawValue?.let { scannedValue ->
+                                    barcode = scannedValue
+                                    if (type == "CD") {
+                                        lookupScope.launch {
+                                            isLookingUp = true
+                                            val musicResult = lookupMusicRelease(scannedValue)
+                                            isLookingUp = false
+                                            if (musicResult != null) {
+                                                title = musicResult.title
+                                                if (people.isBlank()) people = musicResult.artist
+                                                if (releaseDate.isBlank()) releaseDate = musicResult.releaseDate
+                                                if (coverUrl.isBlank()) coverUrl = musicResult.coverUrl
+                                                Toast.makeText(
+                                                    context,
+                                                    "Musikdaten gefunden. Bitte Angaben prüfen.",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            } else {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Barcode erkannt; keine Musikdaten gefunden.",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            }
+                                        }
+                                    } else {
+                                        Toast.makeText(
+                                            context,
+                                            "Barcode erkannt. Für Filme bitte den Titel eingeben und über TMDB suchen.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                }
+                            }
+                            .addOnCanceledListener {
+                                // Der Scan wurde abgebrochen; der Eintrag bleibt unverändert.
+                            }
+                            .addOnFailureListener {
+                                Toast.makeText(
+                                    context,
+                                    "Barcode-Scan nicht möglich. Bitte erneut versuchen.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("▦ Barcode mit Kamera scannen")
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (title.isNotBlank()) {
+                        onSave(
+                            MediumEntity(
+                                title = title.trim(),
+                                originalTitle = originalTitle.trim(),
+                                mediumType = type,
+                                genre = genre.trim(),
+                                releaseDateGermany = releaseDate.trim(),
+                                people = people.trim(),
+                                barcode = barcode.trim(),
+                                coverUrl = coverUrl.trim()
+                            )
+                        )
+                    }
+                },
+                enabled = title.isNotBlank(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Green
+                )
+            ) {
+                Text("Speichern", color = Background)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Abbrechen", color = Muted)
+            }
+        }
+    )
+
+    if (showMusicResults) {
+        AlertDialog(
+            onDismissRequest = { showMusicResults = false },
+            containerColor = Panel,
+            title = { Text("CD-Ausgabe auswählen", color = SoftWhite) },
+            text = {
+                Column(
+                    modifier = Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        "Wähle möglichst die Ausgabe aus, die zu deiner CD passt. Die Daten werden erst beim Speichern übernommen.",
+                        color = Muted,
+                        fontSize = 12.sp
+                    )
+                    musicResults.forEach { result ->
+                        OutlinedButton(
+                            onClick = {
+                                title = result.title
+                                if (people.isBlank()) people = result.artist
+                                if (releaseDate.isBlank()) releaseDate = result.releaseDate
+                                if (result.coverUrl.isNotBlank()) coverUrl = result.coverUrl
+                                if (barcode.isBlank()) barcode = result.barcode
+                                showMusicResults = false
+                                if (genre.isBlank() && result.releaseGroupId.isNotBlank()) {
+                                    lookupScope.launch {
+                                        val foundGenre = lookupMusicGenres(result.releaseGroupId)
+                                        if (genre.isBlank() && foundGenre.isNotBlank()) genre = foundGenre
+                                    }
+                                }
+                                Toast.makeText(context, "CD-Treffer übernommen. Genre wird, falls verfügbar, ergänzt.", Toast.LENGTH_SHORT).show()
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            contentPadding = PaddingValues(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                if (result.coverUrl.isNotBlank()) {
+                                    AsyncImage(
+                                        model = result.coverUrl,
+                                        contentDescription = "Cover von ${result.title}",
+                                        modifier = Modifier.size(width = 64.dp, height = 64.dp).clip(RoundedCornerShape(6.dp)),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                }
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(result.title, fontWeight = FontWeight.Bold)
+                                    if (result.artist.isNotBlank()) Text(result.artist, fontSize = 12.sp)
+                                    val details = listOf(result.releaseDate.take(4), result.country, result.format)
+                                        .filter { it.isNotBlank() }
+                                        .joinToString(" · ")
+                                    if (details.isNotBlank()) Text(details, fontSize = 11.sp, color = Muted)
+                                    if (result.barcode.isNotBlank()) Text("Barcode: ${result.barcode}", fontSize = 11.sp, color = Muted)
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showMusicResults = false }) {
+                    Text("Schließen", color = Green)
+                }
+            }
+        )
+    }
+
+    if (showFilmResults) {
+        AlertDialog(
+            onDismissRequest = { showFilmResults = false },
+            containerColor = Panel,
+            title = { Text("Passenden Treffer auswählen", color = SoftWhite) },
+            text = {
+                Column(
+                    modifier = Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    filmResults.forEach { result ->
+                        OutlinedButton(
+                            onClick = {
+                                title = result.title
+                                if (originalTitle.isBlank()) originalTitle = result.originalTitle
+                                if (genre.isBlank()) genre = result.genres
+                                if (releaseDate.isBlank()) releaseDate = result.year
+                                if (result.posterUrl.isNotBlank()) coverUrl = result.posterUrl
+                                showFilmResults = false
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Text(
+                                    "${result.title}${if (result.year.isNotBlank()) " (${result.year})" else ""} · ${result.mediaType}",
+                                    fontWeight = FontWeight.Bold
+                                )
+                                if (result.originalTitle.isNotBlank() && result.originalTitle != result.title) {
+                                    Text("Original: ${result.originalTitle}", fontSize = 12.sp)
+                                }
+                                if (result.overview.isNotBlank()) {
+                                    Text(result.overview, fontSize = 11.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showFilmResults = false }) {
+                    Text("Schließen", color = Green)
+                }
+            }
+        )
+    }
+}
+
+@Composable
+fun MediumCard(item: MediumEntity, onClick: () -> Unit) {
+    val colorIndex = when (item.mediumType) {
+        "CD" -> 2
+        "DVD" -> 3
+        else -> 1
+    }
+    val colors = listOf(
+        coverColors[colorIndex],
+        Color(0xFF17232E)
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(0.70f)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Brush.verticalGradient(colors)),
+            contentAlignment = Alignment.Center
+        ) {
+            if (item.coverUrl.isNotBlank()) {
+                AsyncImage(
+                    model = item.coverUrl,
+                    contentDescription = "Cover von ${item.title}",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
+                // Leichte Abdunklung sorgt dafür, dass Titel und Medientyp lesbar bleiben.
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.28f))
+                )
+            }
+
+            Column(
+                modifier = Modifier.padding(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    item.mediumType.uppercase(),
+                    color = Color.White.copy(alpha = 0.9f),
+                    fontSize = 11.sp
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    item.title.uppercase(),
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    lineHeight = 21.sp,
+                    fontWeight = FontWeight.Black,
+                    maxLines = 4,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (item.people.isNotBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        item.people,
+                        color = Color.White.copy(alpha = 0.9f),
+                        fontSize = 10.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(7.dp))
+        Text(
+            item.title,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 14.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(item.mediumType, fontSize = 12.sp, color = Muted)
+    }
+}
+
+@Composable
+fun MediumDetails(
+    item: MediumEntity,
+    onBack: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(20.dp)
+    ) {
+        TextButton(onClick = onBack) {
+            Text("← Zurück zur Sammlung", color = Green)
+        }
+
+        Spacer(Modifier.height(12.dp))
+        Text(item.title, fontSize = 27.sp, fontWeight = FontWeight.Bold)
+        if (item.originalTitle.isNotBlank()) {
+            Text("Originaltitel: ${item.originalTitle}", color = Muted)
+        }
+
+        Spacer(Modifier.height(20.dp))
+        DetailRow("Medientyp", item.mediumType)
+        DetailRow("Genre", item.genre)
+        DetailRow("Erscheinungsdatum DE", item.releaseDateGermany)
+        DetailRow("Schauspieler / Künstler", item.people)
+        DetailRow("Barcode", item.barcode)
+        DetailRow("Ausgabe", item.edition)
+        DetailRow("Notizen", item.notes)
+
+        Spacer(Modifier.height(24.dp))
+        Button(
+            onClick = onEdit,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Green)
+        ) {
+            Text("Medium bearbeiten", color = Background, fontWeight = FontWeight.Bold)
+        }
+
+        Spacer(Modifier.height(10.dp))
+        OutlinedButton(
+            onClick = onDelete,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Medium löschen")
+        }
+    }
+}
+
+@Composable
+fun DetailRow(label: String, value: String) {
+    if (value.isNotBlank()) {
+        Column(Modifier.padding(vertical = 7.dp)) {
+            Text(label, color = Muted, fontSize = 12.sp)
+            Text(value, color = SoftWhite, fontSize = 16.sp)
+        }
+    }
+}

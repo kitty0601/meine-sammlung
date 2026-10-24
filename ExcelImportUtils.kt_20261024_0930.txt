@@ -1,0 +1,165 @@
+package com.example.meinesammlung
+
+import android.util.Xml
+import org.xmlpull.v1.XmlPullParser
+import java.io.InputStream
+import java.util.zip.ZipInputStream
+
+/** Liest einfache .xlsx-Dateien ohne zusätzliche Bibliotheken ein. */
+fun parseExcelMedia(input: InputStream): List<MediumEntity> {
+    val entries = mutableMapOf<String, ByteArray>()
+    ZipInputStream(input).use { zip ->
+        while (true) {
+            val entry = zip.nextEntry ?: break
+            if (!entry.isDirectory && (entry.name == "xl/sharedStrings.xml" ||
+                        entry.name == "xl/worksheets/sheet1.xml")) {
+                entries[entry.name] = zip.readBytes()
+            }
+            zip.closeEntry()
+        }
+    }
+
+    val sheetBytes = entries["xl/worksheets/sheet1.xml"]
+        ?: throw IllegalArgumentException("Die Excel-Datei enthält kein lesbares erstes Tabellenblatt. Bitte als .xlsx speichern.")
+    val sharedStrings = entries["xl/sharedStrings.xml"]?.let(::parseSharedStrings).orEmpty()
+    val rows = parseWorksheet(sheetBytes, sharedStrings)
+    if (rows.isEmpty()) throw IllegalArgumentException("Das Tabellenblatt ist leer.")
+
+    val headerRowIndex = rows.indexOfFirst { row ->
+        val values = row.values.map { normalizeHeader(it) }.toSet()
+        values.contains("titel") && values.contains("medium")
+    }
+    if (headerRowIndex < 0) {
+        throw IllegalArgumentException("Die Spaltenüberschriften 'Titel' und 'Medium' wurden nicht gefunden.")
+    }
+
+    val headers = rows[headerRowIndex].mapValues { normalizeHeader(it.value) }
+    val titleColumn = headers.entries.firstOrNull { it.value in setOf("titel", "title", "album", "filmtitel") }?.key
+        ?: throw IllegalArgumentException("Die Spalte 'Titel' wurde nicht gefunden.")
+    val typeColumn = headers.entries.firstOrNull { it.value in setOf("medium", "medientyp", "typ", "format") }?.key
+        ?: throw IllegalArgumentException("Die Spalte 'Medium' wurde nicht gefunden.")
+    val artistColumn = headers.entries.firstOrNull { it.value in setOf("interpret", "kuenstler", "artist", "schauspieler") }?.key
+
+    val result = mutableListOf<MediumEntity>()
+    for (rowIndex in headerRowIndex + 1 until rows.size) {
+        val row = rows[rowIndex]
+        val title = row[titleColumn].orEmpty().trim()
+        if (title.isBlank()) continue
+        val rawType = row[typeColumn].orEmpty().trim()
+        val type = normalizeMediumType(rawType)
+            ?: throw IllegalArgumentException("Unbekannter Medientyp in Zeile ${rowIndex + 1}: '$rawType'. Erlaubt sind CD, DVD und Blu-ray.")
+        val artist = artistColumn?.let { row[it].orEmpty().trim() }.orEmpty()
+        result += MediumEntity(
+            title = title,
+            people = artist,
+            mediumType = type
+        )
+    }
+    if (result.isEmpty()) throw IllegalArgumentException("Es wurden keine Medieneinträge gefunden.")
+    return result
+}
+
+private fun normalizeMediumType(value: String): String? = when (
+    value.trim().lowercase().replace("-", "").replace(" ", "")
+) {
+    "cd", "audio-cd", "audiocd" -> "CD"
+    "dvd" -> "DVD"
+    "bluray", "blu-ray", "bd" -> "Blu-ray"
+    else -> null
+}
+
+private fun normalizeHeader(value: String): String = value.trim().lowercase()
+    .replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+    .replace(Regex("[^a-z0-9]"), "")
+
+private fun parseSharedStrings(bytes: ByteArray): List<String> {
+    val parser = Xml.newPullParser().apply {
+        setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
+        setInput(bytes.inputStream(), "UTF-8")
+    }
+    val strings = mutableListOf<String>()
+    var inItem = false
+    var inText = false
+    val current = StringBuilder()
+    var event = parser.eventType
+    while (event != XmlPullParser.END_DOCUMENT) {
+        when (event) {
+            XmlPullParser.START_TAG -> when (parser.name) {
+                "si" -> { inItem = true; current.setLength(0) }
+                "t" -> if (inItem) inText = true
+            }
+            XmlPullParser.TEXT -> if (inItem && inText) current.append(parser.text)
+            XmlPullParser.END_TAG -> when (parser.name) {
+                "t" -> inText = false
+                "si" -> { strings += current.toString(); inItem = false }
+            }
+        }
+        event = parser.next()
+    }
+    return strings
+}
+
+private fun parseWorksheet(bytes: ByteArray, sharedStrings: List<String>): List<Map<Int, String>> {
+    val parser = Xml.newPullParser().apply {
+        setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
+        setInput(bytes.inputStream(), "UTF-8")
+    }
+    val rows = mutableListOf<Map<Int, String>>()
+    var currentRow: MutableMap<Int, String>? = null
+    var cellRef = ""
+    var cellType = ""
+    var cellValue = StringBuilder()
+    var inCell = false
+    var captureText = false
+    var captureTag = ""
+    var event = parser.eventType
+    while (event != XmlPullParser.END_DOCUMENT) {
+        when (event) {
+            XmlPullParser.START_TAG -> when (parser.name) {
+                "row" -> currentRow = mutableMapOf()
+                "c" -> {
+                    inCell = true
+                    cellRef = parser.getAttributeValue(null, "r").orEmpty()
+                    cellType = parser.getAttributeValue(null, "t").orEmpty()
+                    cellValue = StringBuilder()
+                }
+                "v", "t" -> if (inCell) { captureText = true; captureTag = parser.name }
+            }
+            XmlPullParser.TEXT -> if (inCell && captureText) cellValue.append(parser.text)
+            XmlPullParser.END_TAG -> when (parser.name) {
+                "v", "t" -> if (captureTag == parser.name) { captureText = false; captureTag = "" }
+                "c" -> {
+                    val column = columnIndex(cellRef)
+                    if (column >= 0) {
+                        val raw = cellValue.toString()
+                        val value = if (cellType == "s") {
+                            sharedStrings.getOrNull(raw.toIntOrNull() ?: -1).orEmpty()
+                        } else raw
+                        currentRow?.set(column, value)
+                    }
+                    inCell = false
+                }
+                "row" -> {
+                    rows += currentRow ?: mutableMapOf()
+                    currentRow = null
+                }
+            }
+        }
+        event = parser.next()
+    }
+    return rows
+}
+
+private fun columnIndex(cellReference: String): Int {
+    var result = 0
+    var found = false
+    for (char in cellReference) {
+        if (char.isLetter()) {
+            val upper = char.uppercaseChar()
+            if (upper !in 'A'..'Z') break
+            result = result * 26 + (upper - 'A' + 1)
+            found = true
+        } else break
+    }
+    return if (found) result - 1 else -1
+}

@@ -1,0 +1,54 @@
+
+package com.example.meinesammlung
+
+import androidx.room.Dao
+import androidx.room.Delete
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import androidx.room.Update
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface MediumDao {
+
+    @Query("SELECT * FROM media ORDER BY title COLLATE NOCASE ASC")
+    fun getAll(): Flow<List<MediumEntity>>
+
+    @Query("""
+        SELECT * FROM media
+        WHERE title LIKE '%' || :query || '%'
+           OR originalTitle LIKE '%' || :query || '%'
+           OR people LIKE '%' || :query || '%'
+           OR barcode LIKE '%' || :query || '%'
+        ORDER BY title COLLATE NOCASE ASC
+    """)
+    fun search(query: String): Flow<List<MediumEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insert(medium: MediumEntity): Long
+
+    @Update
+    suspend fun update(medium: MediumEntity)
+
+    @Delete
+    suspend fun delete(medium: MediumEntity)
+
+    @Query("SELECT * FROM media WHERE barcode = :barcode LIMIT 1")
+    suspend fun findByBarcode(barcode: String): MediumEntity?
+    @Query("""
+    SELECT * FROM media
+    WHERE LOWER(TRIM(title)) = LOWER(TRIM(:title))
+      AND LOWER(TRIM(mediumType)) = LOWER(TRIM(:mediumType))
+      AND (
+          :people = ''
+          OR LOWER(TRIM(people)) = LOWER(TRIM(:people))
+      )
+    LIMIT 1
+""")
+    suspend fun findPossibleDuplicate(
+        title: String,
+        people: String,
+        mediumType: String
+    ): MediumEntity?
+}
